@@ -32,8 +32,8 @@ parser.add_argument('--batch_size', type=int, default=20, metavar='N',
                     help='batch size')
 parser.add_argument('--bptt', type=int, default=35,
                     help='sequence length')
-parser.add_argument('--bptt_step', type=int, default=8,
-                    help='(max autograd rnn steps)')
+parser.add_argument('--bptt_step', type=int, default=None,
+                    help='bptt step size')
 parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--tied', action='store_true',
@@ -47,6 +47,9 @@ parser.add_argument('--log-interval', type=int, default=200, metavar='N',
 parser.add_argument('--save', type=str,  default='model.pt',
                     help='path to save the final model')
 args = parser.parse_args()
+
+args.bptt_step = args.bptt_step if args.bptt_step else args.bptt
+print('bptt step size is %d' % args.bptt_step)
 
 # Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
@@ -143,43 +146,48 @@ def train():
         #loss = criterion(output.view(-1, ntokens), targets)
         #loss.backward()
 
-        # begin bptt hsm code
+        # Begin bptt hsm code
         hidden_v = repackage_hidden(hidden, volatile=True)
         data_v, _ = get_batch(train_data, i, evaluation=True)
-        hidden_f = {}
-        hidden_f[-1] = repackage_hidden(hidden)
-        h = hidden_v
-        r = list(enumerate(range(0, data.size(0), args.bptt_step)))
-        for f_i,f_r in r[:-1]:
-            output,h = model(data_v[f_r:f_r+args.bptt_step], h)
-            hidden_f[f_i] = repackage_hidden(h, volatile=False,
+        hsm = { -1 : repackage_hidden(hidden) }
+        intervals = list(enumerate(range(0, data.size(0), args.bptt_step)))
+        # Record states at selective intervals and flag the need for grads.
+        # Note we don't need to forward the last interval as we'll do it below.
+        # This loop is most of the extra computation for this approach.
+        for f_i,f_v in intervals[:-1]:
+            output,hidden_v = model(data_v[f_v:f_v+args.bptt_step], hidden_v)
+            hsm[f_i] = repackage_hidden(hidden_v, volatile=False,
                 requires_grad=True)
+
         save_grad=None
         loss = 0
-
-        for b_i, b_r in reversed(r):
-            output,h = model(data[b_r:b_r+args.bptt_step], hidden_f[b_i-1])
+        for b_i, b_v in reversed(intervals):
+            output,h = model(data[b_v:b_v+args.bptt_step], hsm[b_i-1])
             iloss = criterion(output.view(-1, ntokens), 
-                targets[b_r:b_r+args.bptt_step].view(-1))
-            if b_r+args.bptt_step >= data.size(0):
+                targets[b_v:b_v+args.bptt_step].view(-1))
+            if b_v+args.bptt_step >= data.size(0):
+                # No gradient from the future needed.
+                # These are the hidden states for the next sequence.
                 hidden = h
-                iloss.backward(retain_graph=True)
+                iloss.backward()
             else:
-                variables=[]
-                grad_variables=[]
-                variables.append(iloss)
-                grad_variables.append(None)
+                variables=[iloss]
+                grad_variables=[None]   # scalar = None
+                # Associate stored gradients with state variables for 
+                # multi-variable backprop
                 for l in h:
                     variables.append(l)
                     g = save_grad.popleft()
                     grad_variables.append(g)
                 torch.autograd.backward(variables, grad_variables)
             if b_i > 0:
+                # Save the gradients left on the input state variables
                 save_grad = collections.deque()
-                for l in hidden_f[b_i-1]:
-                    tns = l.grad.data.clone()
-                    l.grad.data.zero_()
-                    save_grad.append(tns)
+                for l in hsm[b_i-1]:
+                    # If this fails, could be a non-leaf, in which case exclude;
+                    # its grad will be handled by a leaf
+                    assert(l.grad is not None)  
+                    save_grad.append(l.grad)
             loss += iloss.data[0]
 
         av = 1/(args.batch_size*args.bptt)
