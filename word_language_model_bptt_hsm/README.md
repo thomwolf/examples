@@ -1,56 +1,25 @@
-# Word-level language modeling RNN
+# Word-level language modeling RNN with memory efficient BPTT
 
-This example trains a multi-layer RNN (Elman, GRU, or LSTM) on a language modeling task.
-By default, the training script uses the PTB dataset, provided.
-The trained model can then be used by the generate script to generate new text.
+The original example [README is here](https://github.com/pytorch/examples/blob/master/word_language_model/README.md) and still applies to this example.  This version adds simple memory efficient BPTT similar to that described as selective hidden state memorization (BPTT-HSM) in [[Gruslys 2016 Memory-Efficient Backpropagation Through Time](https://arxiv.org/pdf/1606.03401.pdf) via a new flag '--bptt_step LENGTH'.
 
-```bash
-python main.py --cuda --epochs 6        # Train a LSTM on PTB with CUDA, reaching perplexity of 117.61
-python main.py --cuda --epochs 6 --tied # Train a tied LSTM on PTB with CUDA, reaching perplexity of 110.44
-python main.py --cuda --tied            # Train a tied LSTM on PTB with CUDA for 40 epochs, reaching perplexity of 87.17
-python generate.py                      # Generate samples from the trained LSTM model.
-```
+The approach snips a desired backpropagation sequence length (given with --bptt) into smaller pieces (given with --bptt_step) and runs backpropagation on each piece, attaching input gradients to outputs (since we're going in reverse).  The memory savings occurs because the maximum  chain of Variable history needed is the smaller step value instead of the full BPTT length.  
 
-The model uses the `nn.RNN` module (and its sister modules `nn.GRU` and `nn.LSTM`)
-which will automatically use the cuDNN backend if run on CUDA with cuDNN installed.
-
-During training, if a keyboard interrupt (Ctrl-C) is received,
-training is stopped and the current model is evaluated against the test dataset.
-
-The `main.py` script accepts the following arguments:
+For example, a 512 bptt sequence can be run in two 256 sequence lengths for less memory with an extra 256 sequence forward step computational cost:
 
 ```bash
-optional arguments:
-  -h, --help         show this help message and exit
-  --data DATA        location of the data corpus
-  --model MODEL      type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU)
-  --emsize EMSIZE    size of word embeddings
-  --nhid NHID        humber of hidden units per layer
-  --nlayers NLAYERS  number of layers
-  --lr LR            initial learning rate
-  --clip CLIP        gradient clipping
-  --epochs EPOCHS    upper epoch limit
-  --batch-size N     batch size
-  --bptt BPTT        sequence length
-  --dropout DROPOUT  dropout applied to layers (0 = no dropout)
-  --decay DECAY      learning rate decay per epoch
-  --tied             tie the word embedding and softmax weights
-  --seed SEED        random seed
-  --cuda             use CUDA
-  --log-interval N   report interval
-  --save SAVE        path to save the final model
+python main.py --cuda --epochs 6 --bptt 512 --bptt_step 512
 ```
 
-With these arguments, a variety of models can be tested.
-As an example, the following arguments produce slower but better models:
+On a Titan X (pascal), this takes 11.8 seconds per epoch and uses 2585 MiB.
 
 ```bash
-python main.py --cuda --emsize 650 --nhid 650 --dropout 0.5 --epochs 40           # Test perplexity of 80.97
-python main.py --cuda --emsize 650 --nhid 650 --dropout 0.5 --epochs 40 --tied    # Test perplexity of 75.96
-python main.py --cuda --emsize 1500 --nhid 1500 --dropout 0.65 --epochs 40        # Test perplexity of 77.42
-python main.py --cuda --emsize 1500 --nhid 1500 --dropout 0.65 --epochs 40 --tied # Test perplexity of 72.30
+python main.py --cuda --epochs 6 --bptt 512 --bptt_step 256
 ```
 
-These perplexities are equal or better than
-[Recurrent Neural Network Regularization (Zaremba et al. 2014)](https://arxiv.org/pdf/1409.2329.pdf)
-and are similar to [Using the Output Embedding to Improve Language Models (Press & Wolf 2016](https://arxiv.org/abs/1608.05859) and [Tying Word Vectors and Word Classifiers: A Loss Framework for Language Modeling (Inan et al. 2016)](https://arxiv.org/pdf/1611.01462.pdf), though both of these papers have improved perplexities by using a form of recurrent dropout [(variational dropout)](http://papers.nips.cc/paper/6241-a-theoretically-grounded-application-of-dropout-in-recurrent-neural-networks).
+On the same gpu, this takes 13.1 seconds per epoch and uses 1543 MiB (as reported by nvidia-smi).  Base memory use before training is 463 MiB so memory use is pretty close to 0.50 of original.  Measurements use pytorch 0.2.0.post3.
+
+This code assumes the hidden state returned by the model is a sequence of Variables; if instead it is a sequence of sequences (if layers are kept in seperate sequences for example), code will need modified.
+
+This implementation also turns off size_average of the CrossEntropyLoss criterion and does gradient averaging after all backprop is done in order to match default behavior.
+
+There may be small differences in loss when using bptt_step < bptt due to the non-associativity of floating point arithmetic (a+(b+c) != (a+b)+c).
