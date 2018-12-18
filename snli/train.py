@@ -15,8 +15,9 @@ from util import get_args, makedirs
 
 args = get_args()
 torch.cuda.set_device(args.gpu)
+device = torch.device('cuda:{}'.format(args.gpu))
 
-inputs = data.Field(lower=args.lower)
+inputs = data.Field(lower=args.lower, tokenize='spacy')
 answers = data.Field(sequential=False)
 
 train, dev, test = datasets.SNLI.splits(inputs, answers)
@@ -26,13 +27,13 @@ if args.word_vectors:
     if os.path.isfile(args.vector_cache):
         inputs.vocab.vectors = torch.load(args.vector_cache)
     else:
-        inputs.vocab.load_vectors(wv_dir=args.data_cache, wv_type=args.word_vectors, wv_dim=args.d_embed)
+        inputs.vocab.load_vectors(args.word_vectors)
         makedirs(os.path.dirname(args.vector_cache))
         torch.save(inputs.vocab.vectors, args.vector_cache)
 answers.build_vocab(train)
 
 train_iter, dev_iter, test_iter = data.BucketIterator.splits(
-            (train, dev, test), batch_size=args.batch_size, device=args.gpu)
+            (train, dev, test), batch_size=args.batch_size, device=device)
 
 config = args
 config.n_embed = len(inputs.vocab)
@@ -44,12 +45,12 @@ if config.birnn:
     config.n_cells *= 2
 
 if args.resume_snapshot:
-    model = torch.load(args.resume_snapshot, map_location=lambda storage, locatoin: storage.cuda(args.gpu))
+    model = torch.load(args.resume_snapshot, map_location=device)
 else:
     model = SNLIClassifier(config)
     if args.word_vectors:
-        model.embed.weight.data = inputs.vocab.vectors
-        model.cuda()
+        model.embed.weight.data.copy_(inputs.vocab.vectors)
+        model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 opt = O.Adam(model.parameters(), lr=args.lr)
@@ -57,7 +58,6 @@ opt = O.Adam(model.parameters(), lr=args.lr)
 iterations = 0
 start = time.time()
 best_dev_acc = -1
-train_iter.repeat = False
 header = '  Time Epoch Iteration Progress    (%Epoch)   Loss   Dev/Loss     Accuracy  Dev/Accuracy'
 dev_log_template = ' '.join('{:>6.0f},{:>5.0f},{:>9.0f},{:>5.0f}/{:<5.0f} {:>7.0f}%,{:>8.6f},{:8.6f},{:12.4f},{:12.4f}'.split(','))
 log_template =     ' '.join('{:>6.0f},{:>5.0f},{:>9.0f},{:>5.0f}/{:<5.0f} {:>7.0f}%,{:>8.6f},{},{:12.4f},{}'.split(','))
@@ -78,7 +78,7 @@ for epoch in range(args.epochs):
         answer = model(batch)
 
         # calculate accuracy of predictions in the current batch
-        n_correct += (torch.max(answer, 1)[1].view(batch.label.size()).data == batch.label.data).sum()
+        n_correct += (torch.max(answer, 1)[1].view(batch.label.size()) == batch.label).sum().item()
         n_total += batch.batch_size
         train_acc = 100. * n_correct/n_total
 
@@ -91,7 +91,7 @@ for epoch in range(args.epochs):
         # checkpoint model periodically
         if iterations % args.save_every == 0:
             snapshot_prefix = os.path.join(args.save_path, 'snapshot')
-            snapshot_path = snapshot_prefix + '_acc_{:.4f}_loss_{:.6f}_iter_{}_model.pt'.format(train_acc, loss.data[0], iterations)
+            snapshot_path = snapshot_prefix + '_acc_{:.4f}_loss_{:.6f}_iter_{}_model.pt'.format(train_acc, loss.item(), iterations)
             torch.save(model, snapshot_path)
             for f in glob.glob(snapshot_prefix + '*'):
                 if f != snapshot_path:
@@ -105,15 +105,16 @@ for epoch in range(args.epochs):
 
             # calculate accuracy on validation set
             n_dev_correct, dev_loss = 0, 0
-            for dev_batch_idx, dev_batch in enumerate(dev_iter):
-                 answer = model(dev_batch)
-                 n_dev_correct += (torch.max(answer, 1)[1].view(dev_batch.label.size()).data == dev_batch.label.data).sum()
-                 dev_loss = criterion(answer, dev_batch.label)
+            with torch.no_grad():
+                for dev_batch_idx, dev_batch in enumerate(dev_iter):
+                     answer = model(dev_batch)
+                     n_dev_correct += (torch.max(answer, 1)[1].view(dev_batch.label.size()) == dev_batch.label).sum().item()
+                     dev_loss = criterion(answer, dev_batch.label)
             dev_acc = 100. * n_dev_correct / len(dev)
 
             print(dev_log_template.format(time.time()-start,
                 epoch, iterations, 1+batch_idx, len(train_iter),
-                100. * (1+batch_idx) / len(train_iter), loss.data[0], dev_loss.data[0], train_acc, dev_acc))
+                100. * (1+batch_idx) / len(train_iter), loss.item(), dev_loss.item(), train_acc, dev_acc))
 
             # update best valiation set accuracy
             if dev_acc > best_dev_acc:
@@ -122,7 +123,7 @@ for epoch in range(args.epochs):
 
                 best_dev_acc = dev_acc
                 snapshot_prefix = os.path.join(args.save_path, 'best_snapshot')
-                snapshot_path = snapshot_prefix + '_devacc_{}_devloss_{}__iter_{}_model.pt'.format(dev_acc, dev_loss.data[0], iterations)
+                snapshot_path = snapshot_prefix + '_devacc_{}_devloss_{}__iter_{}_model.pt'.format(dev_acc, dev_loss.item(), iterations)
 
                 # save model, delete previous 'best_snapshot' files
                 torch.save(model, snapshot_path)
@@ -135,6 +136,4 @@ for epoch in range(args.epochs):
             # print progress message
             print(log_template.format(time.time()-start,
                 epoch, iterations, 1+batch_idx, len(train_iter),
-                100. * (1+batch_idx) / len(train_iter), loss.data[0], ' '*8, n_correct/n_total*100, ' '*12))
-
-
+                100. * (1+batch_idx) / len(train_iter), loss.item(), ' '*8, n_correct/n_total*100, ' '*12))
